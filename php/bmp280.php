@@ -69,6 +69,11 @@ const TABLE_SQL = 'CREATE TABLE IF NOT EXISTS readings (
     KEY idx_epoch (received_epoch)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4';
 
+const CONFIG_SQL = 'CREATE TABLE IF NOT EXISTS config (
+    k VARCHAR(64) NOT NULL PRIMARY KEY,
+    v TEXT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4';
+
 function out(int $code, string $body, string $type = 'application/json'): void
 {
     http_response_code($code);
@@ -96,8 +101,27 @@ function db(): PDO
              PDO::ATTR_EMULATE_PREPARES => false]
         );
         $pdo->exec(TABLE_SQL);
+        $pdo->exec(CONFIG_SQL);
     }
     return $pdo;
+}
+
+/** Runtime setting: DB value wins, then .env, then the given default. */
+function cfg_get(string $key, string $default = ''): string
+{
+    static $cache = [];
+    if (array_key_exists($key, $cache)) return $cache[$key];
+    $q = db()->prepare('SELECT v FROM config WHERE k = ?');
+    $q->execute([$key]);
+    $r = $q->fetch();
+    $cache[$key] = ($r && $r['v'] !== null && $r['v'] !== '') ? (string)$r['v'] : $default;
+    return $cache[$key];
+}
+
+function cfg_set(string $key, string $value): void
+{
+    $q = db()->prepare('REPLACE INTO config (k, v) VALUES (?, ?)');
+    $q->execute([$key, $value]);
 }
 
 function given_token(): string
@@ -128,7 +152,7 @@ try {
 }
 
 // ------------------------------- ingest ----------------------------------
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_GET['set_location'])) {
     if (!authorized()) {
         jout(401, ['ok' => false, 'error' => 'unauthorized']);
     }
@@ -272,12 +296,12 @@ $tok    = htmlspecialchars((string)($_GET['token'] ?? ''), ENT_QUOTES);
 $age    = $seen ? (time() - $seen) : 0;
 $ranges = [1 => '1 h', 6 => '6 h', 24 => '24 h', 168 => '7 d', 720 => '30 d'];
 
-// --- station location + display timezone (all optional) ------------------
-$tzName   = env_or('BMP280_TZ', 'UTC');
-$location = env_or('BMP280_LOCATION', '');
-$elevM    = (float)env_or('BMP280_ELEV_M', '0');
-$lat      = env_or('BMP280_LAT', '');
-$lon      = env_or('BMP280_LON', '');
+// --- station location + display timezone: DB (set from the map) wins, then .env ---
+$tzName   = cfg_get('tz', env_or('BMP280_TZ', 'UTC'));
+$location = cfg_get('label', env_or('BMP280_LOCATION', ''));
+$elevM    = (float)cfg_get('elev_m', env_or('BMP280_ELEV_M', '0'));
+$lat      = cfg_get('lat', env_or('BMP280_LAT', ''));
+$lon      = cfg_get('lon', env_or('BMP280_LON', ''));
 
 try {
     $tzObj = new DateTimeZone($tzName);
@@ -305,8 +329,99 @@ function to_sea_level(float $p, float $h): float
     return $p / pow(1.0 - ($h / 44330.0), 5.255);
 }
 
+/** Open-Meteo forecast, cached for 15 minutes in the config table. */
+function weather_get(string $lat, string $lon, string $tzName): ?array
+{
+    $cached = cfg_get('wx_json', '');
+    $ts     = (int)cfg_get('wx_ts', '0');
+    if ($cached !== '' && (time() - $ts) < 900) {
+        $a = json_decode($cached, true);
+        if (is_array($a) && isset($a['current'])) return $a;
+    }
+    $url = 'https://api.open-meteo.com/v1/forecast'
+         . '?latitude=' . urlencode($lat) . '&longitude=' . urlencode($lon)
+         . '&current=temperature_2m,pressure_msl'
+         . '&hourly=temperature_2m,pressure_msl'
+         . '&forecast_days=2&timezone=' . urlencode($tzName);
+    $ctx = stream_context_create(['http' => [
+        'timeout' => 8,
+        'header'  => "User-Agent: bmp280-collector/1.0\r\n",
+    ]]);
+    $raw = @file_get_contents($url, false, $ctx);
+    if ($raw === false || $raw === '') return null;
+    $a = json_decode($raw, true);
+    if (!is_array($a) || !isset($a['current'])) return null;
+    cfg_set('wx_json', $raw);
+    cfg_set('wx_ts', (string)time());
+    return $a;
+}
+
+// ------------------------- location + config endpoints -------------------
+if (isset($_GET['set_location']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $d = json_decode((string)file_get_contents('php://input'), true);
+    if (!is_array($d)) {
+        jout(400, ['ok' => false, 'error' => 'invalid json']);
+    }
+    $nlat = isset($d['lat']) ? (float)$d['lat'] : null;
+    $nlon = isset($d['lon']) ? (float)$d['lon'] : null;
+    if ($nlat === null || $nlon === null || abs($nlat) > 90 || abs($nlon) > 180 || ($nlat === 0.0 && $nlon === 0.0)) {
+        jout(422, ['ok' => false, 'error' => 'lat/lon out of range']);
+    }
+    $label = substr(trim((string)($d['label'] ?? '')), 0, 120);
+    $elev  = isset($d['elev']) && $d['elev'] !== null && $d['elev'] !== '' ? (float)$d['elev'] : null;
+
+    if ($elev === null) {   // free elevation lookup, no key
+        $ctx = stream_context_create(['http' => ['timeout' => 6]]);
+        $raw = @file_get_contents('https://api.open-meteo.com/v1/elevation?latitude=' . $nlat . '&longitude=' . $nlon, false, $ctx);
+        $ea  = $raw ? json_decode($raw, true) : null;
+        if (isset($ea['elevation'][0])) $elev = (float)$ea['elevation'][0];
+    }
+
+    cfg_set('lat', (string)$nlat);
+    cfg_set('lon', (string)$nlon);
+    if ($label !== '') cfg_set('label', $label);
+    if ($elev !== null && $elev > -500 && $elev < 9000) cfg_set('elev_m', (string)round($elev, 1));
+    cfg_set('wx_json', '');
+    cfg_set('wx_ts', '0');
+    jout(200, ['ok' => true, 'lat' => $nlat, 'lon' => $nlon, 'label' => $label, 'elev' => $elev]);
+}
+
+if (($_GET['format'] ?? '') === 'config') {
+    jout(200, ['ok' => true, 'lat' => $lat, 'lon' => $lon, 'label' => $location,
+               'elev_m' => $elevM, 'tz' => $tzName]);
+}
+
 $seaNow = $last ? to_sea_level((float)$last['press_hpa'], $elevM) : null;
 $tzShort = tz_abbrev($tzObj);
+
+// --- Open-Meteo forecast (free, no key), used as an independent reference ---
+$wxCur = null;
+$wxHours = [];
+if ($lat !== '' && $lon !== '') {
+    $wx = weather_get($lat, $lon, $tzName);
+    if ($wx && isset($wx['current'])) {
+        $wxCur = $wx['current'];
+        $nowKey = substr((string)($wxCur['time'] ?? ''), 0, 13);
+        $start = null;
+        if ($nowKey !== '' && isset($wx['hourly']['time'])) {
+            foreach ($wx['hourly']['time'] as $i => $t) {
+                if (strpos($t, $nowKey) === 0) { $start = $i; break; }
+            }
+        }
+        if ($start !== null) {
+            $n = count($wx['hourly']['time']);
+            for ($k = $start + 1; $k <= $start + 6 && $k < $n; $k++) {
+                $wxHours[] = [
+                    't'     => substr($wx['hourly']['time'][$k], 11, 5),
+                    'temp'  => $wx['hourly']['temperature_2m'][$k] ?? null,
+                    'press' => $wx['hourly']['pressure_msl'][$k] ?? null,
+                ];
+            }
+        }
+    }
+}
+$wxDeltaT = null;
+$wxDeltaP = null;
 
 function fnum($v, int $d = 2): string
 {
@@ -387,6 +502,12 @@ $dP24h = ($pressNow !== null && $p24h) ? $pressNow - $p24h['v'] : null;
 $fcTemp = $tempNow === null ? null : $tempNow + $tSlope * 1.0;
 $fcPress = $pressNow === null ? null : $pressNow + $pSlope * 3.0;
 
+// Measured minus Open-Meteo forecast (both at "now").
+$wxDeltaT = ($wxCur && $tempNow !== null && isset($wxCur['temperature_2m']))
+    ? $tempNow - (float)$wxCur['temperature_2m'] : null;
+$wxDeltaP = ($wxCur && $seaNow !== null && isset($wxCur['pressure_msl']))
+    ? $seaNow - (float)$wxCur['pressure_msl'] : null;
+
 // WMO-style pressure tendency over 3 h.
 function tendency(?float $d): array
 {
@@ -418,6 +539,8 @@ function delta_text(?float $d, int $digits = 2): string
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BMP280 · <?= htmlspecialchars($last['device'] ?? 'sensor') ?></title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
 :root{color-scheme:dark}
 body{margin:0;padding:18px;background:#0e1116;color:#e6edf3;font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
@@ -481,6 +604,40 @@ ul.analysis li{margin:3px 0}
   <div class="card"><div class="muted">Readings in range</div>
     <div class="big"><?= number_format((int)($s['n'] ?? 0)) ?></div>
     <div class="muted">samples over <?= $ranges[$hours] ?? ($hours . ' h') ?> · all time <?= number_format($total) ?></div></div>
+
+  <?php if ($wxCur): ?>
+  <div class="card"><div class="muted">Forecast now · Open-Meteo</div>
+    <div class="big"><?= fnum($wxCur['temperature_2m'] ?? null, 1) ?><span class="unit"> °C</span></div>
+    <div class="muted">MSL <?= fnum($wxCur['pressure_msl'] ?? null, 1) ?> hPa</div>
+    <div class="muted">measured − forecast: <span class="<?= $wxDeltaT > 0.3 ? 'up' : ($wxDeltaT < -0.3 ? 'down' : 'flat') ?>"><?= delta_text($wxDeltaT, 1) ?> °C</span>
+      / <span class="<?= $wxDeltaP > 0.5 ? 'up' : ($wxDeltaP < -0.5 ? 'down' : 'flat') ?>"><?= delta_text($wxDeltaP, 1) ?> hPa</span></div></div>
+  <?php elseif ($lat !== ''): ?>
+  <div class="card"><div class="muted">Forecast · Open-Meteo</div>
+    <div class="big">—</div><div class="muted">weather API unreachable right now</div></div>
+  <?php endif; ?>
+</div>
+
+<?php if ($wxHours): ?>
+<div class="card"><div class="muted" style="margin-bottom:6px">Next hours — forecast reference</div>
+<table><thead><tr><th>hour (<?= htmlspecialchars($tzShort) ?>)</th><th>forecast temp °C</th><th>forecast MSL hPa</th></tr></thead>
+<tbody>
+<?php foreach ($wxHours as $w): ?>
+<tr><td><?= htmlspecialchars($w['t']) ?></td><td><?= fnum($w['temp'], 1) ?></td><td><?= fnum($w['press'], 1) ?></td></tr>
+<?php endforeach; ?>
+</tbody></table></div>
+<?php endif; ?>
+
+<div class="card" id="mapcard">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+    <div class="muted">Station location</div>
+    <div class="muted" id="locmsg"><?= $location !== '' ? htmlspecialchars($location) : 'not set — search or click the map' ?></div>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+    <input id="q" placeholder="Search a place, e.g. Kolkata" style="flex:1;min-width:200px;padding:8px 10px;border-radius:8px;border:1px solid #30363d;background:#0d1117;color:#e6edf3;font:14px system-ui">
+    <button onclick="searchPlace()">Search</button>
+    <button class="primary" onclick="saveLoc()">Save location</button>
+  </div>
+  <div id="map" style="height:320px;border-radius:8px;border:1px solid #21262d"></div>
 </div>
 
 <div class="card"><div class="muted" style="margin-bottom:8px">Analysis</div>
@@ -531,6 +688,70 @@ function clockLabel(iso, withDate){
   if (withDate) { opt.day = '2-digit'; opt.month = 'short'; }
   return d.toLocaleString('en-GB', opt) + ' ' + tzShort;
 }
+
+// ------------------- station map: OSM tiles + Nominatim search -------------------
+const startLat = <?= json_encode($lat !== '' ? (float)$lat : null) ?>;
+const startLon = <?= json_encode($lon !== '' ? (float)$lon : null) ?>;
+let map = null, marker = null;
+let picked = { lat: startLat, lon: startLon, label: '' };
+
+function setMarker(){
+  if (!map) return;
+  if (marker) marker.setLatLng([picked.lat, picked.lon]);
+  else marker = L.marker([picked.lat, picked.lon]).addTo(map);
+}
+
+function initMap(){
+  const msg = document.getElementById('locmsg');
+  if (!window.L) { msg.textContent = 'map library blocked'; return; }
+  const centre = picked.lat !== null ? [picked.lat, picked.lon] : [22.5726, 88.3639];
+  map = L.map('map').setView(centre, picked.lat !== null ? 13 : 5);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+  if (picked.lat !== null) marker = L.marker(centre).addTo(map);
+  map.on('click', e => {
+    picked.lat = e.latlng.lat; picked.lon = e.latlng.lng; picked.label = '';
+    setMarker();
+    msg.textContent = 'picked ' + picked.lat.toFixed(4) + ', ' + picked.lon.toFixed(4) + ' — press Save location';
+  });
+}
+
+async function searchPlace(){
+  const q = document.getElementById('q').value.trim();
+  const msg = document.getElementById('locmsg');
+  if (!q) return;
+  msg.textContent = 'searching…';
+  try {
+    const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q));
+    const a = await r.json();
+    if (!a.length) { msg.textContent = 'no match for “' + q + '”'; return; }
+    picked = { lat: parseFloat(a[0].lat), lon: parseFloat(a[0].lon), label: a[0].display_name };
+    map.setView([picked.lat, picked.lon], 13);
+    setMarker();
+    msg.textContent = a[0].display_name;
+  } catch (e) { msg.textContent = 'search failed'; }
+}
+
+async function saveLoc(){
+  const msg = document.getElementById('locmsg');
+  if (picked.lat === null || picked.lon === null) { msg.textContent = 'pick a spot first'; return; }
+  msg.textContent = 'saving…';
+  try {
+    const r = await fetch('?set_location=1&token=' + encodeURIComponent(token), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lat: picked.lat, lon: picked.lon, label: picked.label })
+    });
+    const d = await r.json();
+    if (!d.ok) { msg.textContent = 'error: ' + (d.error || 'unknown'); return; }
+    msg.textContent = 'saved ' + d.lat.toFixed(4) + ', ' + d.lon.toFixed(4)
+      + (d.elev != null ? ' · ' + Math.round(d.elev) + ' m' : '');
+    setTimeout(() => location.reload(), 1200);
+  } catch (e) { msg.textContent = 'save failed'; }
+}
+
+initMap();
 
 function mean(arr, win){
   return arr.map((_, i) => {

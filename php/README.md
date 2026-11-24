@@ -3,6 +3,36 @@
 One file. No dependencies, no build, no systemd, no nginx edits, no SQL to run — the table
 creates itself on the first request. CloudPanel provides the vhost and the certificate.
 
+## Map: pick the station by searching
+
+The dashboard has an **OpenStreetMap** card (Leaflet + OSM tiles):
+
+- type a place in the search box → Nominatim geocodes it, the map jumps there and drops a marker
+- or click anywhere on the map to place the marker
+- **Save location** stores lat/lon/label in the database (`config` table) and looks up the ground
+  elevation from Open-Meteo's free elevation API, so the sea-level pressure card starts working
+  without you entering a height by hand
+
+Saved-in-DB location wins over `.env`; `.env` remains the fallback for a fresh install.
+`GET ?format=config` returns the current values, `POST ?set_location=1` (JSON `{lat,lon,label}`)
+sets them.
+
+## Weather comparison (Open-Meteo, no API key)
+
+When lat/lon are set, the page fetches a forecast from
+[open-meteo.com](https://open-meteo.com/) — cached 15 minutes in the DB, so it costs one request
+per quarter hour:
+
+- **Forecast now** card: model temperature and mean-sea-level pressure next to your measurement,
+  plus `measured − forecast` deltas (green = you read higher)
+- **Next hours** table: the following six hours, in your configured timezone
+
+This gives an independent reference for "is my sensor drifting?" — a persistent 5 hPa offset
+usually means the station elevation is wrong, not a broken sensor.
+
+Rate limits (both services are free and keyless): Nominatim allows ~1 request/second and OSM
+tiles are for low-volume use; a personal dashboard is well within both.
+
 ## Location, timezone and sea-level pressure
 
 Optional keys in `.env` (everything falls back to UTC / no location):
