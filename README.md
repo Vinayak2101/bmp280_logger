@@ -104,6 +104,9 @@ See [`vps/README.md`](vps/README.md) for the short version, and
 certificate, install, nginx, verification commands with expected output, backups, token
 rotation and a troubleshooting table.
 
+**Simplest option:** [`php/bmp280.php`](php/README.md) is a single file that does ingest +
+storage + page on a normal CloudPanel PHP site — no service, no nginx edit, no SQL to run.
+
 ```bash
 scp -r vps root@server:/root/bmp280 && ssh root@server 'cd /root/bmp280 && bash install.sh'
 ```
