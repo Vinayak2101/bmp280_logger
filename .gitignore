@@ -1,0 +1,17 @@
+# Build output
+build/
+*.bin
+*.elf
+*.map
+
+# Local secrets (Wi-Fi SSID/password, webhook token)
+secrets.h
+
+# Toolchains, virtualenvs, downloaded datasheets
+tools/
+.venv/
+*.pdf
+
+# OS noise
+.DS_Store
+Thumbs.db

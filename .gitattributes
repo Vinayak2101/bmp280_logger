@@ -1,0 +1,4 @@
+# Keep everything LF so scripts work on the Linux VPS after checkout on Windows.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
