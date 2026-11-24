@@ -149,11 +149,11 @@ if (($_GET['format'] ?? '') === 'csv') {
     header('Content-Disposition: attachment; filename="bmp280.csv"');
     $fh = fopen('php://output', 'w');
     fputcsv($fh, ['received_at', 'device', 'seq', 'sensor_ts', 'uptime_s',
-                  'temp_c', 'press_hpa', 'sea_level_hpa', 'altitude_m', 'rssi', 'heap']);
+                  'temp_c', 'press_hpa', 'sea_level_hpa', 'altitude_m', 'rssi', 'heap'], ',', '"', '');
     foreach ($rows as $r) {
         fputcsv($fh, [gmdate('Y-m-d\TH:i:s\Z', (int)$r['received_epoch']), $r['device'], $r['seq'],
                       $r['sensor_ts'], $r['uptime_s'], $r['temp_c'], $r['press_hpa'],
-                      $r['sea_level_hpa'], $r['altitude_m'], $r['rssi'], $r['heap']]);
+                      $r['sea_level_hpa'], $r['altitude_m'], $r['rssi'], $r['heap']], ',', '"', '');
     }
     fclose($fh);
     exit;
@@ -164,7 +164,10 @@ if (($_GET['format'] ?? '') === 'json') {
     $hours = max(1, min(8760, (int)($_GET['hours'] ?? 24)));
     $limit = max(1, min(20000, (int)($_GET['limit'] ?? 5000)));
     $stmt = $pdo->prepare('SELECT * FROM readings WHERE received_epoch >= ? ORDER BY id ASC LIMIT ?');
-    $stmt->execute([time() - $hours * 3600, $limit]);
+    // LIMIT must be bound as an integer: with native prepares MySQL rejects a string there.
+    $stmt->bindValue(1, time() - $hours * 3600, PDO::PARAM_INT);
+    $stmt->bindValue(2, $limit, PDO::PARAM_INT);
+    $stmt->execute();
     $samples = [];
     foreach ($stmt->fetchAll() as $r) {
         $samples[] = [
