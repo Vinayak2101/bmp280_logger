@@ -47,6 +47,10 @@ BMP280_LON=88.36
 
 - The database **always stores UTC** (`received_epoch`); the zone is applied at render time,
   so changing `BMP280_TZ` retro-actively relabels history instead of corrupting it.
+- **No zone configured?** the dashboard adopts the zone that Open-Meteo resolves for your
+  coordinates (the API is called with `timezone=auto`, returning e.g. `Asia/Kolkata`), and the
+  map's *Save location* button also stores your browser's zone. Setting `BMP280_TZ` explicitly
+  always wins.
 - `BMP280_ELEV_M` enables the **Sea-level pressure** card: station pressure is reduced with
   `P0 = P / (1 - h/44330)^5.255`, which is what weather services report. At 18 m the correction
   is about +2 hPa.

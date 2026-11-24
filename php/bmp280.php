@@ -297,7 +297,8 @@ $age    = $seen ? (time() - $seen) : 0;
 $ranges = [1 => '1 h', 6 => '6 h', 24 => '24 h', 168 => '7 d', 720 => '30 d'];
 
 // --- station location + display timezone: DB (set from the map) wins, then .env ---
-$tzName   = cfg_get('tz', env_or('BMP280_TZ', 'UTC'));
+$tzManual = cfg_get('tz', env_or('BMP280_TZ', ''));
+$tzName   = $tzManual !== '' ? $tzManual : 'UTC';
 $location = cfg_get('label', env_or('BMP280_LOCATION', ''));
 $elevM    = (float)cfg_get('elev_m', env_or('BMP280_ELEV_M', '0'));
 $lat      = cfg_get('lat', env_or('BMP280_LAT', ''));
@@ -342,7 +343,7 @@ function weather_get(string $lat, string $lon, string $tzName): ?array
          . '?latitude=' . urlencode($lat) . '&longitude=' . urlencode($lon)
          . '&current=temperature_2m,pressure_msl'
          . '&hourly=temperature_2m,pressure_msl'
-         . '&forecast_days=2&timezone=' . urlencode($tzName);
+         . '&forecast_days=2&timezone=auto';
     $ctx = stream_context_create(['http' => [
         'timeout' => 8,
         'header'  => "User-Agent: bmp280-collector/1.0\r\n",
@@ -380,6 +381,16 @@ if (isset($_GET['set_location']) && $_SERVER['REQUEST_METHOD'] === 'POST') {
     cfg_set('lat', (string)$nlat);
     cfg_set('lon', (string)$nlon);
     if ($label !== '') cfg_set('label', $label);
+    // Optional: the browser's zone, so display does not depend on the forecast API.
+    $ntz = trim((string)($d['tz'] ?? ''));
+    if ($ntz !== '') {
+        try {
+            new DateTimeZone($ntz);
+            cfg_set('tz', $ntz);
+        } catch (Throwable $e) {
+            // ignore an invalid zone name
+        }
+    }
     if ($elev !== null && $elev > -500 && $elev < 9000) cfg_set('elev_m', (string)round($elev, 1));
     cfg_set('wx_json', '');
     cfg_set('wx_ts', '0');
@@ -396,6 +407,7 @@ $tzShort = tz_abbrev($tzObj);
 
 // --- Open-Meteo forecast (free, no key), used as an independent reference ---
 $wxCur = null;
+$wx = null;
 $wxHours = [];
 if ($lat !== '' && $lon !== '') {
     $wx = weather_get($lat, $lon, $tzName);
@@ -420,6 +432,19 @@ if ($lat !== '' && $lon !== '') {
         }
     }
 }
+// With no zone configured, adopt the one the forecast API resolved for this
+// location (timezone=auto returns e.g. "Asia/Kolkata"), so times are local
+// even before anyone fills in BMP280_TZ.
+if ($tzManual === '' && $wx && !empty($wx['timezone'])) {
+    try {
+        $tzObj  = new DateTimeZone($wx['timezone']);
+        $tzName = $wx['timezone'];
+        $tzShort = tz_abbrev($tzObj);
+    } catch (Throwable $e) {
+        // keep the UTC default
+    }
+}
+
 $wxDeltaT = null;
 $wxDeltaP = null;
 
@@ -741,7 +766,8 @@ async function saveLoc(){
     const r = await fetch('?set_location=1&token=' + encodeURIComponent(token), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ lat: picked.lat, lon: picked.lon, label: picked.label })
+      body: JSON.stringify({ lat: picked.lat, lon: picked.lon, label: picked.label,
+                             tz: Intl.DateTimeFormat().resolvedOptions().timeZone })
     });
     const d = await r.json();
     if (!d.ok) { msg.textContent = 'error: ' + (d.error || 'unknown'); return; }
