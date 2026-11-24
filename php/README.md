@@ -3,6 +3,26 @@
 One file. No dependencies, no build, no systemd, no nginx edits, no SQL to run — the table
 creates itself on the first request. CloudPanel provides the vhost and the certificate.
 
+## Location, timezone and sea-level pressure
+
+Optional keys in `.env` (everything falls back to UTC / no location):
+
+```ini
+BMP280_TZ=Asia/Kolkata        # IANA zone name — display only
+BMP280_LOCATION=City, IN      # label in the dashboard header
+BMP280_ELEV_M=18              # station height above sea level, metres
+BMP280_LAT=22.57              # optional, adds a map link
+BMP280_LON=88.36
+```
+
+- The database **always stores UTC** (`received_epoch`); the zone is applied at render time,
+  so changing `BMP280_TZ` retro-actively relabels history instead of corrupting it.
+- `BMP280_ELEV_M` enables the **Sea-level pressure** card: station pressure is reduced with
+  `P0 = P / (1 - h/44330)^5.255`, which is what weather services report. At 18 m the correction
+  is about +2 hPa.
+- Charts label the first and last sample with local clock times; the table column header shows
+  the zone abbreviation (e.g. `IST`).
+
 ## What the page shows
 
 - 1 h / 6 h / 24 h / 7 d / 30 d range pills

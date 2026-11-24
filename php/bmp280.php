@@ -272,6 +272,42 @@ $tok    = htmlspecialchars((string)($_GET['token'] ?? ''), ENT_QUOTES);
 $age    = $seen ? (time() - $seen) : 0;
 $ranges = [1 => '1 h', 6 => '6 h', 24 => '24 h', 168 => '7 d', 720 => '30 d'];
 
+// --- station location + display timezone (all optional) ------------------
+$tzName   = env_or('BMP280_TZ', 'UTC');
+$location = env_or('BMP280_LOCATION', '');
+$elevM    = (float)env_or('BMP280_ELEV_M', '0');
+$lat      = env_or('BMP280_LAT', '');
+$lon      = env_or('BMP280_LON', '');
+
+try {
+    $tzObj = new DateTimeZone($tzName);
+} catch (Throwable $e) {
+    $tzObj = new DateTimeZone('UTC');
+    $tzName = 'UTC';
+}
+
+function local_str(int $epoch, DateTimeZone $tz): string
+{
+    $d = new DateTime('@' . $epoch);
+    $d->setTimezone($tz);
+    return $d->format('Y-m-d H:i');
+}
+
+function tz_abbrev(DateTimeZone $tz): string
+{
+    return (new DateTime('now', $tz))->format('T');
+}
+
+/** Reduce station pressure to sea level (barometric formula). */
+function to_sea_level(float $p, float $h): float
+{
+    if ($h <= 0.0) return $p;
+    return $p / pow(1.0 - ($h / 44330.0), 5.255);
+}
+
+$seaNow = $last ? to_sea_level((float)$last['press_hpa'], $elevM) : null;
+$tzShort = tz_abbrev($tzObj);
+
 function fnum($v, int $d = 2): string
 {
     return $v === null ? '—' : number_format((float)$v, $d, '.', ',');
@@ -411,7 +447,11 @@ ul.analysis li{margin:3px 0}
 <header>
   <div><h1><?= htmlspecialchars($last['device'] ?? 'BMP280') ?></h1>
     <div class="muted"><span class="dot<?= $online ? ' on' : '' ?>"></span>
-      <?= $online ? 'online' : 'offline' ?> · last reading <?= age_text($age) ?> · <?= number_format($total) ?> rows stored</div></div>
+      <?= $online ? 'online' : 'offline' ?> · last reading <?= age_text($age) ?><?= $last ? ' at ' . local_str($seen, $tzObj) . ' ' . $tzShort : '' ?> · <?= number_format($total) ?> rows stored</div>
+    <?php if ($location !== '' || ($lat !== '' && $lon !== '')): ?>
+    <div class="muted"><?= htmlspecialchars($location) ?><?php if ($lat !== '' && $lon !== ''): ?>
+      · <a href="https://www.openstreetmap.org/?mlat=<?= urlencode($lat) ?>&mlon=<?= urlencode($lon) ?>#map=13/<?= urlencode($lat) ?>/<?= urlencode($lon) ?>">map</a><?php endif; ?></div>
+    <?php endif; ?></div>
   <div><?php foreach ($ranges as $h => $label): ?>
       <a class="pill<?= $h === $hours ? ' active' : '' ?>" href="?hours=<?= $h ?>&token=<?= $tok ?>"><?= $label ?></a>
   <?php endforeach; ?></div>
@@ -429,6 +469,10 @@ ul.analysis li{margin:3px 0}
     <div class="muted">3 h <span class="<?= $dP3h > 0.2 ? 'up' : ($dP3h < -0.2 ? 'down' : 'flat') ?>"><?= arrow($dP3h) ?> <?= delta_text($dP3h) ?></span>
       · 24 h <span class="<?= $dP24h > 0.2 ? 'up' : ($dP24h < -0.2 ? 'down' : 'flat') ?>"><?= delta_text($dP24h) ?></span></div>
     <div class="muted">trend <?= delta_text($pSlope, 3) ?> hPa/h · next 3 h ≈ <?= fnum($fcPress, 1) ?> hPa</div></div>
+
+  <div class="card"><div class="muted">Sea-level pressure</div>
+    <div class="big"><?= fnum($seaNow) ?><span class="unit"> hPa</span></div>
+    <div class="muted"><?= $elevM > 0 ? 'station is ' . fnum($elevM, 1) . ' m above sea level (+' . fnum($seaNow - (float)($last['press_hpa'] ?? 0), 2) . ' hPa)' : 'set BMP280_ELEV_M to enable' ?></div></div>
 
   <div class="card"><div class="muted">Range <?= $ranges[$hours] ?? ($hours . ' h') ?></div>
     <div class="big"><?= fnum($s['tmin'] ?? null, 1) ?> – <?= fnum($s['tmax'] ?? null, 1) ?><span class="unit"> °C</span></div>
@@ -457,10 +501,10 @@ ul.analysis li{margin:3px 0}
   <div class="legend">value <i style="background:#2f81f7"></i> 30-sample mean <i style="background:#8b949e"></i> forecast <i style="background:#d29922"></i></div></div>
 
 <div class="card"><table>
-<thead><tr><th>received (UTC)</th><th>temp °C</th><th>pressure hPa</th><th>alt m</th><th>rssi</th></tr></thead>
+<thead><tr><th>received (<?= htmlspecialchars($tzShort) ?>)</th><th>temp °C</th><th>pressure hPa</th><th>alt m</th><th>rssi</th></tr></thead>
 <tbody>
 <?php foreach ($rows as $r): ?>
-<tr><td><?= htmlspecialchars(gmdate('Y-m-d H:i:s', (int)$r['received_epoch'])) ?></td>
+<tr><td><?= htmlspecialchars(local_str((int)$r['received_epoch'], $tzObj)) ?></td>
     <td><?= number_format((float)$r['temp_c'], 2) ?></td>
     <td><?= number_format((float)$r['press_hpa'], 2, '.', ',') ?></td>
     <td><?= $r['altitude_m'] === null ? '—' : number_format((float)$r['altitude_m'], 1) ?></td>
@@ -477,6 +521,16 @@ ul.analysis li{margin:3px 0}
 <script>
 const token = <?= json_encode(isset($_GET['token']) ? $_GET['token'] : (string)($_COOKIE['bmp280_token'] ?? '')) ?>;
 const hours = <?= (int)$hours ?>;
+const tzName = <?= json_encode($tzName) ?>;
+const tzShort = <?= json_encode($tzShort) ?>;
+
+function clockLabel(iso, withDate){
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const opt = { timeZone: tzName, hour: '2-digit', minute: '2-digit', hour12: false };
+  if (withDate) { opt.day = '2-digit'; opt.month = 'short'; }
+  return d.toLocaleString('en-GB', opt) + ' ' + tzShort;
+}
 
 function mean(arr, win){
   return arr.map((_, i) => {
@@ -486,7 +540,7 @@ function mean(arr, win){
   });
 }
 
-function draw(canvas, values, colour, slope, horizonMin, stepMin){
+function draw(canvas, values, colour, slope, horizonMin, stepMin, startISO, endISO){
   const w = canvas.clientWidth, h = canvas.clientHeight || 220, dpr = devicePixelRatio || 1;
   canvas.width = w * dpr; canvas.height = h * dpr;
   const g = canvas.getContext('2d');
@@ -539,6 +593,12 @@ function draw(canvas, values, colour, slope, horizonMin, stepMin){
 
   g.fillStyle = '#d29922'; g.font = '10px monospace';
   g.fillText(fc.toFixed(2), Math.min(nowX + 6, w - 46), yOf(fc) - 6);
+
+  // Time axis: first and last sample in the configured zone.
+  g.fillStyle = '#8b949e'; g.font = '10px ui-monospace,monospace';
+  g.fillText(clockLabel(startISO, false), padL, h - 4);
+  const endLbl = clockLabel(endISO, false);
+  g.fillText(endLbl, w - padR - g.measureText(endLbl).width, h - 4);
 }
 
 async function load(){
@@ -549,8 +609,9 @@ async function load(){
   const stepMin = Math.max(0.5, span / 60 / Math.max(1, s.length - 1));
 
   const ct = document.getElementById('ct'), cp = document.getElementById('cp');
-  draw(ct, s.map(r => r.temp_c), '#3fb950', parseFloat(ct.dataset.slope), 60, stepMin);
-  draw(cp, s.map(r => r.press_hpa), '#2f81f7', parseFloat(cp.dataset.slope), 180, stepMin);
+  const first = s[0].received_at, last = s[s.length - 1].received_at;
+  draw(ct, s.map(r => r.temp_c), '#3fb950', parseFloat(ct.dataset.slope), 60, stepMin, first, last);
+  draw(cp, s.map(r => r.press_hpa), '#2f81f7', parseFloat(cp.dataset.slope), 180, stepMin, first, last);
 }
 load(); setInterval(load, 30000);
 window.addEventListener('resize', () => load());
