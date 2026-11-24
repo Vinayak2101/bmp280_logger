@@ -3,6 +3,22 @@
 One file. No dependencies, no build, no systemd, no nginx edits, no SQL to run — the table
 creates itself on the first request. CloudPanel provides the vhost and the certificate.
 
+## What the page shows
+
+- 1 h / 6 h / 24 h / 7 d / 30 d range pills
+- current temperature and pressure with 1 h / 24 h deltas and a trend arrow
+- min–max over the selected range, average pressure, sample count
+- **analysis**: WMO-style 3 h pressure tendency (rising / falling / steady with a rapid-change
+  class), least-squares temperature slope in °C/h, and a comparison against 1 h and 3 h ago
+- **forecast**: linear extrapolation of the last 2 h of data — temperature +1 h, pressure +3 h,
+  drawn as a dashed amber continuation of the line, with the fit residual shown as σ
+- charts per quantity with the raw series, a 30-sample mean, and a "now" marker
+- last 25 readings table, plus `export.csv` and a JSON range endpoint
+
+The forecast is deliberately a straight-line extrapolation, not a weather model: it is
+honest about being short-horizon. Pressure tendency is the genuinely predictive signal —
+falling pressure usually means deteriorating weather.
+
 ## 1. Create the site
 
 CloudPanel → **Sites → Add Site → PHP Site** → domain `sensors.example.com` → Create.

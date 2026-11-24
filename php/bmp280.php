@@ -260,16 +260,17 @@ $rows  = $pdo->query('SELECT * FROM readings ORDER BY id DESC LIMIT 25')->fetchA
 $total = (int)$pdo->query('SELECT COUNT(*) FROM readings')->fetchColumn();
 $last  = $rows[0] ?? null;
 
-$st = $pdo->prepare('SELECT COUNT(*) n, MIN(temp_c) tmin, MAX(temp_c) tmax,
-                            MIN(press_hpa) pmin, MAX(press_hpa) pmax
+$st = $pdo->prepare('SELECT COUNT(*) n, MIN(temp_c) tmin, MAX(temp_c) tmax, AVG(temp_c) tavg,
+                            MIN(press_hpa) pmin, MAX(press_hpa) pmax, AVG(press_hpa) pavg
                      FROM readings WHERE received_epoch >= ?');
 $st->execute([time() - $hours * 3600]);
-$s = $st->fetch() ?: ['n' => 0, 'tmin' => null, 'tmax' => null, 'pmin' => null, 'pmax' => null];
+$s = $st->fetch() ?: [];
 
 $seen   = $last ? (int)$last['received_epoch'] : 0;
 $online = $seen > 0 && (time() - $seen) < 300;
 $tok    = htmlspecialchars((string)($_GET['token'] ?? ''), ENT_QUOTES);
 $age    = $seen ? (time() - $seen) : 0;
+$ranges = [1 => '1 h', 6 => '6 h', 24 => '24 h', 168 => '7 d', 720 => '30 d'];
 
 function fnum($v, int $d = 2): string
 {
@@ -285,7 +286,97 @@ function age_text(int $s): string
     return intdiv($s, 86400) . ' d ago';
 }
 
-$ranges = [1 => '1 h', 6 => '6 h', 24 => '24 h', 168 => '7 d'];
+/** Nearest sample at or before $epoch, or null. */
+function value_at(PDO $pdo, int $epoch, string $col): ?array
+{
+    if (!in_array($col, ['temp_c', 'press_hpa'], true)) return null;
+    $q = $pdo->prepare("SELECT $col AS v, received_epoch AS e FROM readings
+                        WHERE received_epoch <= ? ORDER BY received_epoch DESC LIMIT 1");
+    $q->execute([$epoch]);
+    $r = $q->fetch();
+    return $r ? ['v' => (float)$r['v'], 'e' => (int)$r['e']] : null;
+}
+
+/** Least-squares fit over the last $n samples: slope per hour + residual sigma. */
+function trend(PDO $pdo, string $col, int $n = 120): array
+{
+    if (!in_array($col, ['temp_c', 'press_hpa'], true)) return [0.0, 0.0];
+    $q = $pdo->prepare("SELECT $col AS v, received_epoch AS e FROM readings
+                        ORDER BY id DESC LIMIT $n");
+    $q->execute();
+    $pts = array_reverse($q->fetchAll());
+    $k = count($pts);
+    if ($k < 4) return [0.0, 0.0];
+
+    $t0 = (int)$pts[0]['e'];
+    $sx = $sy = $sxy = $sxx = 0.0;
+    foreach ($pts as $p) {
+        $x = ((int)$p['e'] - $t0) / 3600.0;
+        $y = (float)$p['v'];
+        $sx += $x; $sy += $y; $sxy += $x * $y; $sxx += $x * $x;
+    }
+    $den = $k * $sxx - $sx * $sx;
+    if (abs($den) < 1e-9) return [0.0, 0.0];
+    $slope = ($k * $sxy - $sx * $sy) / $den;
+    $inter = ($sy - $slope * $sx) / $k;
+
+    $ss = 0.0;
+    foreach ($pts as $p) {
+        $x = ((int)$p['e'] - $t0) / 3600.0;
+        $res = (float)$p['v'] - ($inter + $slope * $x);
+        $ss += $res * $res;
+    }
+    return [$slope, sqrt($ss / $k)];   // hPa or °C per hour, residual sigma
+}
+
+$now = time();
+[$tSlope, $tSigma] = trend($pdo, 'temp_c');
+[$pSlope, $pSigma] = trend($pdo, 'press_hpa');
+
+$tempNow = $last ? (float)$last['temp_c'] : null;
+$pressNow = $last ? (float)$last['press_hpa'] : null;
+
+// Observed deltas over fixed windows (nearest sample at or before the window start).
+$t1h = value_at($pdo, $now - 3600, 'temp_c');
+$t24h = value_at($pdo, $now - 86400, 'temp_c');
+$p3h = value_at($pdo, $now - 10800, 'press_hpa');
+$p24h = value_at($pdo, $now - 86400, 'press_hpa');
+
+$dT1h = ($tempNow !== null && $t1h) ? $tempNow - $t1h['v'] : null;
+$dT24h = ($tempNow !== null && $t24h) ? $tempNow - $t24h['v'] : null;
+$dP3h = ($pressNow !== null && $p3h) ? $pressNow - $p3h['v'] : null;
+$dP24h = ($pressNow !== null && $p24h) ? $pressNow - $p24h['v'] : null;
+
+// Forecast = linear extrapolation of the last-2h trend (not a weather model).
+$fcTemp = $tempNow === null ? null : $tempNow + $tSlope * 1.0;
+$fcPress = $pressNow === null ? null : $pressNow + $pSlope * 3.0;
+
+// WMO-style pressure tendency over 3 h.
+function tendency(?float $d): array
+{
+    if ($d === null) return ['unknown', 'not enough history yet'];
+    if ($d <= -3.5) return ['falling rapidly', 'weather likely to deteriorate quickly'];
+    if ($d <= -1.0) return ['falling', 'weather likely to deteriorate'];
+    if ($d >= 3.5) return ['rising rapidly', 'weather likely to improve quickly'];
+    if ($d >= 1.0) return ['rising', 'weather likely to improve'];
+    return ['steady', 'weather likely to stay similar'];
+}
+
+[$tendLabel, $tendNote] = tendency($dP3h);
+
+function arrow(?float $d, float $deadband = 0.1): string
+{
+    if ($d === null) return '·';
+    if ($d > $deadband) return '▲';
+    if ($d < -$deadband) return '▼';
+    return '▬';
+}
+
+function delta_text(?float $d, int $digits = 2): string
+{
+    if ($d === null) return '—';
+    return ($d >= 0 ? '+' : '') . number_format($d, $digits, '.', '');
+}
 ?>
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -300,10 +391,11 @@ h1{font-size:17px;margin:0;font-weight:600}
 .dot.on{background:#3fb950}
 .muted{color:#8b949e;font-size:12px}
 .card{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px;margin-bottom:12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}
 .big{font-size:25px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.2}
 .unit{font-size:13px;color:#8b949e;font-weight:400}
-canvas{width:100%;height:230px;display:block}
+.up{color:#3fb950}.down{color:#f85149}.flat{color:#8b949e}
+canvas{width:100%;height:220px;display:block}
 table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
 th,td{padding:6px;text-align:right;border-bottom:1px solid #21262d}
 th{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.6px}
@@ -311,6 +403,10 @@ td:first-child,th:first-child{text-align:left;color:#8b949e}
 a{color:#2f81f7;text-decoration:none}
 .pill{display:inline-block;padding:2px 9px;border-radius:999px;background:#21262d;font-size:12px;margin-right:6px}
 .pill.active{background:#238636}
+ul.analysis{margin:0;padding-left:18px}
+ul.analysis li{margin:3px 0}
+.legend{font-size:11px;color:#8b949e;margin-top:6px}
+.legend i{display:inline-block;width:14px;height:2px;vertical-align:middle;margin:0 4px 2px 10px}
 </style></head><body>
 <header>
   <div><h1><?= htmlspecialchars($last['device'] ?? 'BMP280') ?></h1>
@@ -323,20 +419,42 @@ a{color:#2f81f7;text-decoration:none}
 
 <div class="grid">
   <div class="card"><div class="muted">Temperature</div>
-    <div class="big"><?= fnum($last['temp_c'] ?? null) ?><span class="unit"> °C</span></div>
-    <div class="muted">min <?= fnum($s['tmin']) ?> · max <?= fnum($s['tmax']) ?></div></div>
+    <div class="big"><?= fnum($tempNow) ?><span class="unit"> °C</span></div>
+    <div class="muted">1 h <span class="<?= $dT1h > 0.1 ? 'up' : ($dT1h < -0.1 ? 'down' : 'flat') ?>"><?= arrow($dT1h) ?> <?= delta_text($dT1h) ?></span>
+      · 24 h <span class="<?= $dT24h > 0.1 ? 'up' : ($dT24h < -0.1 ? 'down' : 'flat') ?>"><?= delta_text($dT24h) ?></span></div>
+    <div class="muted">trend <?= delta_text($tSlope, 3) ?> °C/h · next hour ≈ <?= fnum($fcTemp, 1) ?> °C</div></div>
+
   <div class="card"><div class="muted">Pressure</div>
-    <div class="big"><?= fnum($last['press_hpa'] ?? null) ?><span class="unit"> hPa</span></div>
-    <div class="muted">min <?= fnum($s['pmin']) ?> · max <?= fnum($s['pmax']) ?></div></div>
-  <div class="card"><div class="muted">Altitude</div>
-    <div class="big"><?= fnum($last['altitude_m'] ?? null, 1) ?><span class="unit"> m</span></div>
-    <div class="muted">from 1013.25 hPa reference</div></div>
-  <div class="card"><div class="muted">In selected range</div>
-    <div class="big"><?= number_format($s['n']) ?></div>
-    <div class="muted">readings over <?= $ranges[$hours] ?? ($hours . ' h') ?></div></div>
+    <div class="big"><?= fnum($pressNow) ?><span class="unit"> hPa</span></div>
+    <div class="muted">3 h <span class="<?= $dP3h > 0.2 ? 'up' : ($dP3h < -0.2 ? 'down' : 'flat') ?>"><?= arrow($dP3h) ?> <?= delta_text($dP3h) ?></span>
+      · 24 h <span class="<?= $dP24h > 0.2 ? 'up' : ($dP24h < -0.2 ? 'down' : 'flat') ?>"><?= delta_text($dP24h) ?></span></div>
+    <div class="muted">trend <?= delta_text($pSlope, 3) ?> hPa/h · next 3 h ≈ <?= fnum($fcPress, 1) ?> hPa</div></div>
+
+  <div class="card"><div class="muted">Range <?= $ranges[$hours] ?? ($hours . ' h') ?></div>
+    <div class="big"><?= fnum($s['tmin'] ?? null, 1) ?> – <?= fnum($s['tmax'] ?? null, 1) ?><span class="unit"> °C</span></div>
+    <div class="muted">pressure <?= fnum($s['pmin'] ?? null, 1) ?> – <?= fnum($s['pmax'] ?? null, 1) ?> hPa · avg <?= fnum($s['pavg'] ?? null, 1) ?></div></div>
+
+  <div class="card"><div class="muted">Readings in range</div>
+    <div class="big"><?= number_format((int)($s['n'] ?? 0)) ?></div>
+    <div class="muted">samples over <?= $ranges[$hours] ?? ($hours . ' h') ?> · all time <?= number_format($total) ?></div></div>
 </div>
 
-<div class="card"><canvas id="c" data-hours="<?= $hours ?>" data-token="<?= $tok ?>"></canvas></div>
+<div class="card"><div class="muted" style="margin-bottom:8px">Analysis</div>
+<ul class="analysis">
+  <li>Pressure is <b><?= htmlspecialchars($tendLabel) ?></b> (<?= delta_text($dP3h) ?> hPa in 3 h) — <?= htmlspecialchars($tendNote) ?>.</li>
+  <li>Temperature trend over the last 2 h is <b><?= $tSlope >= 0 ? 'rising' : 'falling' ?></b> at <?= delta_text(abs($tSlope), 2) ?> °C/h<?= $tSigma > 0 ? ' (fit σ ' . number_format($tSigma, 2) . ' °C)' : '' ?>.</li>
+  <li>Current reading is <?= delta_text($dT1h) ?> °C / <?= delta_text($dP3h) ?> hPa versus one and three hours ago; range extremes <?= fnum($s['tmin'] ?? null, 1) ?>–<?= fnum($s['tmax'] ?? null, 1) ?> °C.</li>
+</ul>
+<div class="muted" style="margin-top:8px">Forecast is a linear extrapolation of the recent trend, not a weather model. Expect it to be wrong when conditions change.</div>
+</div>
+
+<div class="card"><div class="muted" style="margin-bottom:6px">Temperature · <?= $ranges[$hours] ?? ($hours . ' h') ?></div>
+  <canvas id="ct" data-kind="temp" data-slope="<?= $tSlope ?>" data-horizon="60"></canvas>
+  <div class="legend">value <i style="background:#3fb950"></i> 30-sample mean <i style="background:#8b949e"></i> forecast <i style="background:#d29922"></i></div></div>
+
+<div class="card"><div class="muted" style="margin-bottom:6px">Pressure · <?= $ranges[$hours] ?? ($hours . ' h') ?></div>
+  <canvas id="cp" data-kind="press" data-slope="<?= $pSlope ?>" data-horizon="180"></canvas>
+  <div class="legend">value <i style="background:#2f81f7"></i> 30-sample mean <i style="background:#8b949e"></i> forecast <i style="background:#d29922"></i></div></div>
 
 <div class="card"><table>
 <thead><tr><th>received (UTC)</th><th>temp °C</th><th>pressure hPa</th><th>alt m</th><th>rssi</th></tr></thead>
@@ -357,33 +475,83 @@ a{color:#2f81f7;text-decoration:none}
 </p></div>
 
 <script>
-const c = document.getElementById('c');
-const hours = c.dataset.hours, token = encodeURIComponent(c.dataset.token);
-async function load(){
-  const d = await (await fetch('?format=json&hours=' + hours + '&limit=5000&token=' + token)).json();
-  draw(d.samples.map(s => s.temp_c), d.samples.map(s => s.press_hpa));
+const token = <?= json_encode(isset($_GET['token']) ? $_GET['token'] : (string)($_COOKIE['bmp280_token'] ?? '')) ?>;
+const hours = <?= (int)$hours ?>;
+
+function mean(arr, win){
+  return arr.map((_, i) => {
+    const from = Math.max(0, i - win + 1);
+    const slice = arr.slice(from, i + 1);
+    return slice.reduce((a, b) => a + b, 0) / slice.length;
+  });
 }
-function draw(t, p){
-  const w = c.clientWidth, h = 230, dpr = devicePixelRatio || 1;
-  c.width = w * dpr; c.height = h * dpr;
-  const g = c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
-  if (t.length < 2) { g.fillStyle = '#8b949e'; g.font = '12px system-ui'; g.fillText('collecting…', 10, h/2); return; }
-  const all = t.concat(p); let min = Math.min(...all), max = Math.max(...all);
+
+function draw(canvas, values, colour, slope, horizonMin, stepMin){
+  const w = canvas.clientWidth, h = canvas.clientHeight || 220, dpr = devicePixelRatio || 1;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  if (values.length < 2) { g.fillStyle = '#8b949e'; g.font = '12px system-ui'; g.fillText('collecting…', 10, h/2); return; }
+
+  const fc = values[values.length - 1] + slope * (horizonMin / 60);
+  const all = values.concat([fc]);
+  let min = Math.min(...all), max = Math.max(...all);
   if (max - min < 1) { const m = (max + min) / 2; min = m - 1; max = m + 1; }
-  const padL = 44, padR = 10, padT = 12, padB = 18;
-  const x = i => padL + (w - padL - padR) * i / (t.length - 1),
-        y = v => h - padB - (h - padT - padB) * (v - min) / (max - min);
-  g.strokeStyle = 'rgba(139,148,158,.18)'; g.lineWidth = 1;
+
+  const padL = 46, padR = 12, padT = 12, padB = 18;
+  const totalMin = (values.length - 1) * stepMin + horizonMin;
+  const xOf = m => padL + (w - padL - padR) * m / totalMin;
+  const yOf = v => h - padB - (h - padT - padB) * (v - min) / (max - min);
+
+  g.strokeStyle = 'rgba(139,148,158,.16)'; g.lineWidth = 1;
   for (let k = 0; k <= 4; k++) {
     const yy = padT + (h - padT - padB) * k / 4;
     g.beginPath(); g.moveTo(padL, yy); g.lineTo(w - padR, yy); g.stroke();
     g.fillStyle = '#8b949e'; g.font = '10px ui-monospace,monospace';
-    g.fillText((max - (max - min) * k / 4).toFixed(1), 4, yy + 3);
+    g.fillText((max - (max - min) * k / 4).toFixed(1), 2, yy + 3);
   }
-  [[p, '#2f81f7'], [t, '#3fb950']].forEach(([arr, colour]) => {
-    g.beginPath(); arr.forEach((v, i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v)));
-    g.strokeStyle = colour; g.lineWidth = 1.8; g.stroke();
-  });
+
+  const nowX = xOf((values.length - 1) * stepMin);
+  g.strokeStyle = 'rgba(139,148,158,.35)'; g.setLineDash([4, 3]);
+  g.beginPath(); g.moveTo(nowX, padT); g.lineTo(nowX, h - padB); g.stroke();
+  g.setLineDash([]);
+  g.fillStyle = '#8b949e'; g.fillText('now', nowX + 4, padT + 10);
+
+  const line = (arr, offsetMin, col, width, dash) => {
+    g.beginPath();
+    arr.forEach((v, i) => {
+      const xx = xOf(offsetMin + i * stepMin), yy = yOf(v);
+      i ? g.lineTo(xx, yy) : g.moveTo(xx, yy);
+    });
+    g.strokeStyle = col; g.lineWidth = width; g.setLineDash(dash || []);
+    g.stroke(); g.setLineDash([]);
+  };
+
+  line(mean(values, 30), 0, 'rgba(139,148,158,.75)', 1.2);
+  line(values, 0, colour, 1.8);
+
+  // Forecast: straight extrapolation from "now" to "now + horizon".
+  g.beginPath();
+  g.moveTo(nowX, yOf(values[values.length - 1]));
+  g.lineTo(xOf((values.length - 1) * stepMin + horizonMin), yOf(fc));
+  g.strokeStyle = '#d29922'; g.lineWidth = 1.6; g.setLineDash([5, 4]);
+  g.stroke(); g.setLineDash([]);
+
+  g.fillStyle = '#d29922'; g.font = '10px monospace';
+  g.fillText(fc.toFixed(2), Math.min(nowX + 6, w - 46), yOf(fc) - 6);
 }
-load(); setInterval(load, 15000);
+
+async function load(){
+  const d = await (await fetch('?format=json&hours=' + hours + '&limit=5000&token=' + encodeURIComponent(token))).json();
+  const s = d.samples;
+  if (!s.length) return;
+  const span = Math.max(1, (new Date(s[s.length-1].received_at) - new Date(s[0].received_at)) / 1000);
+  const stepMin = Math.max(0.5, span / 60 / Math.max(1, s.length - 1));
+
+  const ct = document.getElementById('ct'), cp = document.getElementById('cp');
+  draw(ct, s.map(r => r.temp_c), '#3fb950', parseFloat(ct.dataset.slope), 60, stepMin);
+  draw(cp, s.map(r => r.press_hpa), '#2f81f7', parseFloat(cp.dataset.slope), 180, stepMin);
+}
+load(); setInterval(load, 30000);
+window.addEventListener('resize', () => load());
 </script></body></html>
