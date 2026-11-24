@@ -113,7 +113,7 @@ function given_token(): string
     if (preg_match('/Bearer\s+(.+)/i', $h, $m)) {
         return trim($m[1]);
     }
-    return trim((string)($_GET['token'] ?? ''));
+    return trim((string)($_GET['token'] ?? ($_COOKIE['bmp280_token'] ?? '')));
 }
 
 function authorized(): bool
@@ -170,7 +170,37 @@ if (isset($_GET['health'])) {
 }
 
 if (!authorized()) {
-    jout(401, ['ok' => false, 'error' => 'unauthorized']);
+    if (isset($_GET['format'])) {
+        jout(401, ['ok' => false, 'error' => 'unauthorized']);
+    }
+    // Browser without a token: ask once, then remember it in a cookie.
+    http_response_code(401);
+    header('Content-Type: text/html; charset=utf-8');
+    $bad = isset($_GET['token']);
+    ?>
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>BMP280 · sign in</title>
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0e1116;color:#e6edf3;
+     font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+form{background:#161b22;border:1px solid #21262d;border-radius:12px;padding:22px;width:min(90vw,340px)}
+h1{font-size:16px;margin:0 0 4px}
+p{color:#8b949e;font-size:12px;margin:0 0 14px}
+input{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;border:1px solid #30363d;
+      background:#0d1117;color:#e6edf3;font:13px ui-monospace,monospace}
+button{margin-top:12px;width:100%;padding:9px;border-radius:8px;border:1px solid #2ea043;
+       background:#238636;color:#fff;font-weight:600;cursor:pointer}
+.err{color:#f85149;font-size:12px;margin-top:10px}
+</style></head><body>
+<form method="get" action="">
+  <h1>BMP280 dashboard</h1>
+  <p>Paste the API token to unlock this browser.</p>
+  <input name="token" type="password" placeholder="token" autofocus autocomplete="current-password">
+  <button type="submit">Open dashboard</button>
+  <?php if ($bad): ?><div class="err">Token did not match.</div><?php endif; ?>
+</form></body></html>
+    <?php
+    exit;
 }
 
 // -------------------------------- csv ------------------------------------
@@ -214,79 +244,146 @@ if (($_GET['format'] ?? '') === 'json') {
 }
 
 // ------------------------------- page ------------------------------------
-$rows = $pdo->query('SELECT * FROM readings ORDER BY id DESC LIMIT 25')->fetchAll();
+// Remember the token in a cookie so the URL only needs it once.
+if (isset($_GET['token']) && hash_equals(TOKEN, (string)$_GET['token'])) {
+    setcookie('bmp280_token', TOKEN, [
+        'expires'  => time() + 90 * 86400,
+        'path'     => '/',
+        'httponly' => true,
+        'secure'   => true,
+        'samesite' => 'Lax',
+    ]);
+}
+
+$hours = max(1, min(8760, (int)($_GET['hours'] ?? 24)));
+$rows  = $pdo->query('SELECT * FROM readings ORDER BY id DESC LIMIT 25')->fetchAll();
 $total = (int)$pdo->query('SELECT COUNT(*) FROM readings')->fetchColumn();
-$last = $rows[0] ?? null;
-$t = htmlspecialchars($_GET['token'], ENT_QUOTES);
+$last  = $rows[0] ?? null;
+
+$st = $pdo->prepare('SELECT COUNT(*) n, MIN(temp_c) tmin, MAX(temp_c) tmax,
+                            MIN(press_hpa) pmin, MAX(press_hpa) pmax
+                     FROM readings WHERE received_epoch >= ?');
+$st->execute([time() - $hours * 3600]);
+$s = $st->fetch() ?: ['n' => 0, 'tmin' => null, 'tmax' => null, 'pmin' => null, 'pmax' => null];
+
+$seen   = $last ? (int)$last['received_epoch'] : 0;
+$online = $seen > 0 && (time() - $seen) < 300;
+$tok    = htmlspecialchars((string)($_GET['token'] ?? ''), ENT_QUOTES);
+$age    = $seen ? (time() - $seen) : 0;
+
+function fnum($v, int $d = 2): string
+{
+    return $v === null ? '—' : number_format((float)$v, $d, '.', ',');
+}
+
+function age_text(int $s): string
+{
+    if ($s <= 0) return 'never';
+    if ($s < 60) return $s . ' s ago';
+    if ($s < 3600) return intdiv($s, 60) . ' min ago';
+    if ($s < 86400) return intdiv($s, 3600) . ' h ago';
+    return intdiv($s, 86400) . ' d ago';
+}
+
+$ranges = [1 => '1 h', 6 => '6 h', 24 => '24 h', 168 => '7 d'];
 ?>
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BMP280 readings</title>
+<title>BMP280 · <?= htmlspecialchars($last['device'] ?? 'sensor') ?></title>
 <style>
-body{margin:0;padding:20px;background:#0e1116;color:#e6edf3;font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
-h1{font-size:18px;margin:0 0 12px}
-.card{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px;margin-bottom:14px}
-.big{font-size:26px;font-weight:600}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
-canvas{width:100%;height:200px;display:block}
+:root{color-scheme:dark}
+body{margin:0;padding:18px;background:#0e1116;color:#e6edf3;font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+header{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+h1{font-size:17px;margin:0;font-weight:600}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:#f85149}
+.dot.on{background:#3fb950}
+.muted{color:#8b949e;font-size:12px}
+.card{background:#161b22;border:1px solid #21262d;border-radius:10px;padding:14px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(165px,1fr));gap:12px}
+.big{font-size:25px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.2}
+.unit{font-size:13px;color:#8b949e;font-weight:400}
+canvas{width:100%;height:230px;display:block}
 table{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}
 th,td{padding:6px;text-align:right;border-bottom:1px solid #21262d}
 th{color:#8b949e;font-size:11px;text-transform:uppercase;letter-spacing:.6px}
 td:first-child,th:first-child{text-align:left;color:#8b949e}
-a{color:#2f81f7}
+a{color:#2f81f7;text-decoration:none}
+.pill{display:inline-block;padding:2px 9px;border-radius:999px;background:#21262d;font-size:12px;margin-right:6px}
+.pill.active{background:#238636}
 </style></head><body>
-<h1>BMP280 readings</h1>
+<header>
+  <div><h1><?= htmlspecialchars($last['device'] ?? 'BMP280') ?></h1>
+    <div class="muted"><span class="dot<?= $online ? ' on' : '' ?>"></span>
+      <?= $online ? 'online' : 'offline' ?> · last reading <?= age_text($age) ?> · <?= number_format($total) ?> rows stored</div></div>
+  <div><?php foreach ($ranges as $h => $label): ?>
+      <a class="pill<?= $h === $hours ? ' active' : '' ?>" href="?hours=<?= $h ?>&token=<?= $tok ?>"><?= $label ?></a>
+  <?php endforeach; ?></div>
+</header>
+
 <div class="grid">
- <div class="card"><div style="color:#8b949e;font-size:11px;text-transform:uppercase">Temperature</div>
-   <div class="big"><?= $last ? number_format((float)$last['temp_c'], 2) : '—' ?><span style="font-size:13px;color:#8b949e"> °C</span></div></div>
- <div class="card"><div style="color:#8b949e;font-size:11px;text-transform:uppercase">Pressure</div>
-   <div class="big"><?= $last ? number_format((float)$last['press_hpa'], 2) : '—' ?><span style="font-size:13px;color:#8b949e"> hPa</span></div></div>
- <div class="card"><div style="color:#8b949e;font-size:11px;text-transform:uppercase">Altitude</div>
-   <div class="big"><?= $last && $last['altitude_m'] !== null ? number_format((float)$last['altitude_m'], 1) : '—' ?><span style="font-size:13px;color:#8b949e"> m</span></div></div>
- <div class="card"><div style="color:#8b949e;font-size:11px;text-transform:uppercase">Stored / last seen</div>
-   <div class="big"><?= $total ?></div>
-   <div style="font-size:12px;color:#8b949e"><?= $last ? htmlspecialchars(gmdate('Y-m-d H:i:s', (int)$last['received_epoch'])) . ' UTC' : 'no data yet' ?></div></div>
+  <div class="card"><div class="muted">Temperature</div>
+    <div class="big"><?= fnum($last['temp_c'] ?? null) ?><span class="unit"> °C</span></div>
+    <div class="muted">min <?= fnum($s['tmin']) ?> · max <?= fnum($s['tmax']) ?></div></div>
+  <div class="card"><div class="muted">Pressure</div>
+    <div class="big"><?= fnum($last['press_hpa'] ?? null) ?><span class="unit"> hPa</span></div>
+    <div class="muted">min <?= fnum($s['pmin']) ?> · max <?= fnum($s['pmax']) ?></div></div>
+  <div class="card"><div class="muted">Altitude</div>
+    <div class="big"><?= fnum($last['altitude_m'] ?? null, 1) ?><span class="unit"> m</span></div>
+    <div class="muted">from 1013.25 hPa reference</div></div>
+  <div class="card"><div class="muted">In selected range</div>
+    <div class="big"><?= number_format($s['n']) ?></div>
+    <div class="muted">readings over <?= $ranges[$hours] ?? ($hours . ' h') ?></div></div>
 </div>
-<div class="card"><canvas id="c"></canvas></div>
+
+<div class="card"><canvas id="c" data-hours="<?= $hours ?>" data-token="<?= $tok ?>"></canvas></div>
+
 <div class="card"><table>
-<thead><tr><th>received (UTC)</th><th>device</th><th>temp °C</th><th>pressure hPa</th><th>alt m</th></tr></thead>
+<thead><tr><th>received (UTC)</th><th>temp °C</th><th>pressure hPa</th><th>alt m</th><th>rssi</th></tr></thead>
 <tbody>
 <?php foreach ($rows as $r): ?>
 <tr><td><?= htmlspecialchars(gmdate('Y-m-d H:i:s', (int)$r['received_epoch'])) ?></td>
-    <td><?= htmlspecialchars($r['device']) ?></td>
     <td><?= number_format((float)$r['temp_c'], 2) ?></td>
-    <td><?= number_format((float)$r['press_hpa'], 2) ?></td>
-    <td><?= $r['altitude_m'] === null ? '—' : number_format((float)$r['altitude_m'], 1) ?></td></tr>
+    <td><?= number_format((float)$r['press_hpa'], 2, '.', ',') ?></td>
+    <td><?= $r['altitude_m'] === null ? '—' : number_format((float)$r['altitude_m'], 1) ?></td>
+    <td><?= $r['rssi'] === null ? '—' : (int)$r['rssi'] ?></td></tr>
 <?php endforeach; if (!$rows): ?>
 <tr><td colspan="5">no data yet</td></tr>
 <?php endif; ?>
 </tbody></table>
-<p style="font-size:12px;color:#8b949e">
- <a href="?format=csv&token=<?= $t ?>">export.csv</a> ·
- <a href="?format=json&hours=24&token=<?= $t ?>">JSON 24h</a>
+<p class="muted" style="margin:10px 0 0">
+ <a href="?format=csv&token=<?= $tok ?>">export.csv</a> ·
+ <a href="?format=json&hours=<?= $hours ?>&token=<?= $tok ?>">JSON <?= $ranges[$hours] ?? ($hours . ' h') ?></a>
 </p></div>
+
 <script>
-const T = new URLSearchParams(location.search).get('token') || '';
+const c = document.getElementById('c');
+const hours = c.dataset.hours, token = encodeURIComponent(c.dataset.token);
 async function load(){
-  const d = await (await fetch('?format=json&hours=24&limit=2000&token=' + encodeURIComponent(T))).json();
+  const d = await (await fetch('?format=json&hours=' + hours + '&limit=5000&token=' + token)).json();
   draw(d.samples.map(s => s.temp_c), d.samples.map(s => s.press_hpa));
 }
 function draw(t, p){
-  const c = document.getElementById('c'), w = c.clientWidth, h = 200, dpr = devicePixelRatio || 1;
+  const w = c.clientWidth, h = 230, dpr = devicePixelRatio || 1;
   c.width = w * dpr; c.height = h * dpr;
   const g = c.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
   if (t.length < 2) { g.fillStyle = '#8b949e'; g.font = '12px system-ui'; g.fillText('collecting…', 10, h/2); return; }
   const all = t.concat(p); let min = Math.min(...all), max = Math.max(...all);
   if (max - min < 1) { const m = (max + min) / 2; min = m - 1; max = m + 1; }
-  const pad = 10, x = i => pad + (w - 2*pad) * i / (t.length - 1),
-        y = v => h - pad - (h - 2*pad) * (v - min) / (max - min);
+  const padL = 44, padR = 10, padT = 12, padB = 18;
+  const x = i => padL + (w - padL - padR) * i / (t.length - 1),
+        y = v => h - padB - (h - padT - padB) * (v - min) / (max - min);
+  g.strokeStyle = 'rgba(139,148,158,.18)'; g.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) {
+    const yy = padT + (h - padT - padB) * k / 4;
+    g.beginPath(); g.moveTo(padL, yy); g.lineTo(w - padR, yy); g.stroke();
+    g.fillStyle = '#8b949e'; g.font = '10px ui-monospace,monospace';
+    g.fillText((max - (max - min) * k / 4).toFixed(1), 4, yy + 3);
+  }
   [[p, '#2f81f7'], [t, '#3fb950']].forEach(([arr, colour]) => {
     g.beginPath(); arr.forEach((v, i) => i ? g.lineTo(x(i), y(v)) : g.moveTo(x(i), y(v)));
     g.strokeStyle = colour; g.lineWidth = 1.8; g.stroke();
   });
-  g.fillStyle = '#8b949e'; g.font = '10px monospace';
-  g.fillText(max.toFixed(1), 4, 10); g.fillText(min.toFixed(1), 4, h - 2);
 }
 load(); setInterval(load, 15000);
 </script></body></html>

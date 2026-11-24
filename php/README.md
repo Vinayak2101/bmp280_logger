@@ -18,11 +18,16 @@ CloudPanel → **Databases → Add Database**:
 
 ## 3. Put the files in place
 
-Copy `bmp280.php` to the site's document root:
+Copy `bmp280.php` **and** `index.php` to the site's document root:
 
 ```
-/home/<site-user>/htdocs/sensors.example.com/bmp280.php
+/home/<site-user>/htdocs/sensors.example.com/bmp280.php   <- device webhook target
+/home/<site-user>/htdocs/sensors.example.com/index.php    <- dashboard at the root URL
 ```
+
+`index.php` just requires `bmp280.php`, so the dashboard is `https://<domain>/` and the device
+keeps posting to `https://<domain>/bmp280.php`. Opening the root URL in a browser asks for the
+token once, then stores it in an HttpOnly cookie and remembers the browser for 90 days.
 
 Copy `.env.example` to `.env` **one level above the document root**, so it can never be
 downloaded over HTTP:
