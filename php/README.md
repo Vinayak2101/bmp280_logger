@@ -16,7 +16,7 @@ CloudPanel → **Databases → Add Database**:
 - User: `bmp280` (CloudPanel may prefix both with the site user — **copy exactly what it shows**)
 - Password: generate, copy it
 
-## 3. Put the file in place
+## 3. Put the files in place
 
 Copy `bmp280.php` to the site's document root:
 
@@ -24,19 +24,27 @@ Copy `bmp280.php` to the site's document root:
 /home/<site-user>/htdocs/sensors.example.com/bmp280.php
 ```
 
-Use CloudPanel's **File Manager** (Sites → domain → File Manager) or SFTP.
+Copy `.env.example` to `.env` **one level above the document root**, so it can never be
+downloaded over HTTP:
 
-Then edit the five constants at the top of the file:
-
-```php
-const DB_HOST = 'localhost';
-const DB_NAME = 'bmp280';          // exactly as created
-const DB_USER = 'bmp280';          // exactly as created
-const DB_PASS = 'the-password';
-const TOKEN   = 'paste output of: openssl rand -hex 24';
+```
+/home/<site-user>/htdocs/.env
 ```
 
-Set permissions: `640` for the file is enough (it is web-served, so don't use 600).
+Then fill it in:
+
+```ini
+BMP280_DB_HOST=localhost
+BMP280_DB_NAME=bmp280          # exactly as created
+BMP280_DB_USER=bmp280          # exactly as created
+BMP280_DB_PASS=the-password
+BMP280_TOKEN=<openssl rand -hex 24>
+```
+
+The script looks for `.env` next to itself or one directory above it, and falls back to
+`localhost`/`bmp280`/`CHANGE-ME` if neither exists. Permissions: `640` for both files, owner the
+site user. `bmp280.php` must be readable by PHP-FPM; `.env` should not be web-readable at all —
+if in doubt, `chmod 640` and confirm `https://sensors.example.com/.env` returns 403/404.
 
 ## 4. Check it
 

@@ -8,19 +8,50 @@
  *   GET   bmp280.php?format=csv&token=...            CSV
  *   GET   bmp280.php?health=1                        {"ok":true,"count":N}
  *
- * Setup: edit the four DB_* constants and TOKEN below, upload to your site's
- * document root. The table is created automatically on first request.
+ * Setup: copy .env.example to .env (ideally one level above the web root) and fill it in,
+ * upload this file to your site's document root. The table is created automatically on
+ * first request. Without a .env the defaults below apply.
  */
 
 declare(strict_types=1);
 
-// ------------------------- edit these four lines -------------------------
-const DB_HOST = 'localhost';
-const DB_NAME = 'bmp280';      // created in CloudPanel -> Databases
-const DB_USER = 'bmp280';      // database user
-const DB_PASS = 'CHANGE-ME';   // database password
-const TOKEN   = 'CHANGE-ME';   // openssl rand -hex 24  (also pasted into the ESP32)
-// -------------------------------------------------------------------------
+// ------------------------------ configuration -----------------------------
+// Reads .env from the script's folder or one level above it. Environment variables that
+// are already set (e.g. by PHP-FPM) win over the file.
+foreach ([dirname(__DIR__) . '/.env', __DIR__ . '/.env'] as $envFile) {
+    if (!is_readable($envFile)) {
+        continue;
+    }
+    foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#' || !str_contains($line, '=')) {
+            continue;
+        }
+        [$k, $v] = explode('=', $line, 2);
+        $k = trim($k);
+        $v = trim($v);
+        if (strlen($v) > 1 && (($v[0] === '"' && substr($v, -1) === '"') || ($v[0] === "'" && substr($v, -1) === "'"))) {
+            $v = substr($v, 1, -1);
+        }
+        if (getenv($k) === false) {
+            putenv("$k=$v");
+        }
+    }
+    break;
+}
+
+function env_or(string $key, string $default): string
+{
+    $v = getenv($key);
+    return ($v === false || $v === '') ? $default : $v;
+}
+
+define('DB_HOST', env_or('BMP280_DB_HOST', 'localhost'));
+define('DB_NAME', env_or('BMP280_DB_NAME', 'bmp280'));   // created in CloudPanel -> Databases
+define('DB_USER', env_or('BMP280_DB_USER', 'bmp280'));   // database user
+define('DB_PASS', env_or('BMP280_DB_PASS', 'CHANGE-ME'));
+define('TOKEN',   env_or('BMP280_TOKEN', 'CHANGE-ME'));  // openssl rand -hex 24, also on the ESP32
+// --------------------------------------------------------------------------
 
 const TABLE_SQL = 'CREATE TABLE IF NOT EXISTS readings (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,

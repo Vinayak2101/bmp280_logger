@@ -6,6 +6,8 @@ build/
 
 # Local secrets (Wi-Fi SSID/password, webhook token)
 secrets.h
+.env
+php/.env
 
 # Toolchains, virtualenvs, downloaded datasheets
 tools/
