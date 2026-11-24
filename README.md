@@ -99,7 +99,10 @@ disabled, so you can tell "module unpowered" from "module powered but not ACKing
 
 ## Collector (VPS)
 
-See [`vps/README.md`](vps/README.md). Short version:
+See [`vps/README.md`](vps/README.md) for the short version, and
+**[`docs/DEPLOY.md`](docs/DEPLOY.md)** for the full CloudPanel walkthrough — DNS, site type,
+certificate, install, nginx, verification commands with expected output, backups, token
+rotation and a troubleshooting table.
 
 ```bash
 scp -r vps root@server:/root/bmp280 && ssh root@server 'cd /root/bmp280 && bash install.sh'
